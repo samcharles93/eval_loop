@@ -40,8 +40,8 @@ import (
 )
 
 var (
-    version = "dev"
-    commit  = "unknown"
+	version = "dev"
+	commit  = "unknown"
 )
 
 // ── colour helpers ────────────────────────────────────────────────────────────
@@ -796,6 +796,11 @@ func streamEvents(ctx context.Context, runner *anthropic.BetaToolRunnerStreaming
 // ── main ──────────────────────────────────────────────────────────────────────
 
 func main() {
+	if len(os.Args) > 1 && (os.Args[1] == "--version" || os.Args[1] == "-v") {
+		fmt.Printf("eval_loop version: %s  commit: %s\n", version, commit)
+		os.Exit(0)
+	}
+
 	// ── resolve package root ──────────────────────────────────────────────────
 	if len(os.Args) > 1 {
 		pkgRoot = os.Args[1]
@@ -814,8 +819,8 @@ func main() {
 	fmt.Printf(cInfo("[eval_loop] version: %s  commit: %s\n"), version, commit)
 
 	if info, err := os.Stat(pkgRoot); err != nil || !info.IsDir() {
-	    fmt.Printf(cErr("package root %q does not exist or is not a directory\n"), pkgRoot)
-	    os.Exit(1)
+		fmt.Printf(cErr("package root %q does not exist or is not a directory\n"), pkgRoot)
+		os.Exit(1)
 	}
 
 	fmt.Println(cInfo("[eval_loop] package root: " + pkgRoot))
