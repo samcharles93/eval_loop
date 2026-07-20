@@ -9,10 +9,15 @@
 //
 //	go run . ./mypackage
 //	go run . -model openai/gpt-5.4 -gate-test ./mypackage
+//	go run . -model ollama/qwen3-coder -host http://remote-box:11434 ./mypackage
 //
-// The model is a runtime ref ("provider/model"). Keys come from the
-// conventional env vars (DEEPSEEK_API_KEY, OPENAI_API_KEY,
-// ANTHROPIC_API_KEY); ollama needs none.
+// The model is a runtime ref ("provider/model"); the provider must name
+// one of the ai-sdk built-in classes (openai, anthropic, deepseek, groq,
+// mistral, cohere, gemini, perplexity, xai, azure, ollama, ...). Keys are
+// read from the conventional "<PROVIDER>_API_KEY" env var; ollama needs
+// none. -host overrides that provider's base URL for the run, for a
+// remote ollama server or a cloud-compatible endpoint (e.g. an Azure
+// OpenAI gateway or self-hosted proxy).
 //
 // Optional: eval_config.json in the package root provides
 // package-specific context (description, extra rules, source list).
@@ -73,9 +78,41 @@ func main() {
 	os.Exit(run())
 }
 
+func usage() {
+	fmt.Fprintf(os.Stderr, `eval_loop — generic Go package evaluator powered by an LLM agent.
+
+Usage:
+  eval_loop [flags] [package-path]
+
+  package-path defaults to $PKG_PATH, or "." if unset.
+
+Examples:
+  eval_loop ./mypackage
+  eval_loop -model openai/gpt-5.4 -gate-test ./mypackage
+  eval_loop -model ollama/qwen3-coder -host http://remote-box:11434 ./mypackage
+
+Flags:
+`)
+	flag.PrintDefaults()
+	fmt.Fprintf(os.Stderr, `
+The provider in -model must name an ai-sdk built-in class (openai,
+anthropic, deepseek, groq, mistral, cohere, gemini, perplexity, xai,
+azure, ollama, ...). API keys are read from "<PROVIDER>_API_KEY"
+(e.g. OPENAI_API_KEY, GROQ_API_KEY). Ollama needs no key.
+
+eval_config.json in the package root optionally provides package-specific
+context (description, extra rules, source list) — see EvalConfig.
+
+Exit codes: 0 = passed or idle (nothing to do), 2 = parked (gate/budget/
+blocked), 1 = infrastructure error.
+`)
+}
+
 func run() int {
+	flag.Usage = usage
 	showVersion := flag.Bool("version", false, "print version and exit")
-	model := flag.String("model", "deepseek/deepseek-chat", "runtime model ref (provider/model)")
+	model := flag.String("model", "deepseek/deepseek-chat", `model ref "provider/model", e.g. openai/gpt-5.4, anthropic/claude-sonnet-5, ollama/qwen3-coder`)
+	host := flag.String("host", "", "override the base URL for -model's provider (e.g. a remote ollama server or a custom endpoint for a cloud-compatible model)")
 	contextMode := flag.String("context", "preload", "context strategy: preload (all sources up front) or ondemand")
 	gateTest := flag.Bool("gate-test", false, "include 'go test ./... -count=1' in the quality gate")
 	gateLint := flag.Bool("gate-lint", lintAvailable(), "include 'golangci-lint run' in the quality gate (default: on when golangci-lint is installed)")
@@ -136,14 +173,20 @@ func run() int {
 		preload = sourceFilesFor(pkgRoot, cfg, skip)
 	}
 
+	providerID, _, hasSlash := strings.Cut(*model, "/")
+	providerID = strings.TrimSpace(providerID)
+	if !hasSlash || providerID == "" {
+		fmt.Fprintf(os.Stderr, "eval_loop: -model %q must be of the form \"provider/model\"\n", *model)
+		return 1
+	}
+	pcfg := providerConfigFor(providerID)
+	if *host != "" {
+		pcfg.BaseURL = *host
+	}
+
 	runtime.RegisterBuiltinClasses()
 	rt := runtime.NewRuntime(runtime.Config{
-		Providers: map[string]runtime.ProviderConfig{
-			"deepseek":  {ID: "deepseek", Class: "deepseek", Auth: runtime.AuthConfig{APIKeyEnv: "DEEPSEEK_API_KEY"}},
-			"openai":    {ID: "openai", Class: "openai", Auth: runtime.AuthConfig{APIKeyEnv: "OPENAI_API_KEY"}},
-			"anthropic": {ID: "anthropic", Class: "anthropic", Auth: runtime.AuthConfig{APIKeyEnv: "ANTHROPIC_API_KEY"}},
-			"ollama":    {ID: "ollama", Class: "ollama", Auth: runtime.AuthConfig{Type: runtime.AuthTypeNone}},
-		},
+		Providers: map[string]runtime.ProviderConfig{providerID: pcfg},
 	})
 
 	res, err := agentloop.Run(context.Background(), agentloop.Config{
@@ -187,6 +230,23 @@ func run() int {
 func lintAvailable() bool {
 	_, err := exec.LookPath("golangci-lint")
 	return err == nil
+}
+
+// providerConfigFor derives a runtime.ProviderConfig for id by convention
+// rather than a hardcoded registry: the ai-sdk provider class names match
+// their conventional provider ID (openai, anthropic, deepseek, groq,
+// mistral, cohere, gemini, perplexity, xai, azure, ollama, ...), and keys
+// are read from "<PROVIDER>_API_KEY". ollama is the one built-in class
+// that takes no key.
+func providerConfigFor(id string) runtime.ProviderConfig {
+	if id == "ollama" {
+		return runtime.ProviderConfig{ID: id, Class: id, Auth: runtime.AuthConfig{Type: runtime.AuthTypeNone}}
+	}
+	return runtime.ProviderConfig{
+		ID:    id,
+		Class: id,
+		Auth:  runtime.AuthConfig{Type: runtime.AuthTypeAPIKey, APIKeyEnv: strings.ToUpper(id) + "_API_KEY"},
+	}
 }
 
 func loadConfig(pkgRoot string) EvalConfig {
