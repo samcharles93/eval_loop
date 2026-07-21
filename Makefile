@@ -5,13 +5,13 @@ LDFLAGS := -w -s -X main.version=$(VERSION) -X main.commit=$(COMMIT)
 .PHONY: build run clean
 
 build:
-	go build -o eval_loop -ldflags="$(LDFLAGS)" -trimpath .
+	go build -o hone -ldflags="$(LDFLAGS)" -trimpath .
 
 install: build
-	cp eval_loop ~/.local/bin/eval_loop
+	cp hone ~/.local/bin/hone
 
 run:
 	go run -ldflags="$(LDFLAGS)" .
 
 clean:
-	rm -f eval_loop
+	rm -f hone

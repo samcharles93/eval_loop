@@ -1,4 +1,4 @@
-// eval_loop — generic Go package evaluator powered by an LLM agent.
+// hone — generic Go package evaluator powered by an LLM agent.
 //
 // A thin preset over ai-sdk/agentloop: the quality-pass mission, the
 // preload-all context strategy, and the vet + go-fix gate are configured
@@ -16,8 +16,17 @@
 // -goal replaces the built-in quality-pass mission with a custom one and
 // keeps re-invoking the agent (each call still bounded by -max-steps)
 // until it calls finish or -max-runs is exhausted, carrying context
-// forward across invocations via AGENT_NOTES.md. Without -goal, eval_loop
+// forward across invocations via AGENT_NOTES.md. Without -goal, hone
 // runs the quality pass exactly once, as before.
+//
+// When -goal is set (and -verify, on by default), every "passed" run is
+// checked by a second hone process — spawned read-only (-readonly)
+// against the same package — before it's accepted. The reviewer judges
+// the worker's diff and self-reported summary against the original goal
+// and can reject it; a rejection is recorded as a note (so the next run
+// sees it) and the loop continues instead of exiting. This is a
+// self-review gate, not parallelism: one child process, spawned and
+// awaited synchronously, never touching ai-sdk.
 //
 // The model is a runtime ref ("provider/model"); the provider must name
 // one of the ai-sdk built-in classes (openai, anthropic, deepseek, groq,
@@ -92,18 +101,19 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintf(os.Stderr, `eval_loop — generic Go package evaluator powered by an LLM agent.
+	fmt.Fprintf(os.Stderr, `hone — generic Go package evaluator powered by an LLM agent.
 
 Usage:
-  eval_loop [flags] [package-path]
+  hone [flags] [package-path]
 
   package-path defaults to $PKG_PATH, or "." if unset.
 
 Examples:
-  eval_loop ./mypackage
-  eval_loop -model openai/gpt-5.4 -gate-test ./mypackage
-  eval_loop -model ollama/qwen3-coder -host http://remote-box:11434 ./mypackage
-  eval_loop -model openai-compatible/my-local-model -host http://remote-box:8081 ./mypackage
+  hone ./mypackage
+  hone -model openai/gpt-5.4 -gate-test ./mypackage
+  hone -model ollama/qwen3-coder -host http://remote-box:11434 ./mypackage
+  hone -model openai-compatible/my-local-model -host http://remote-box:8081 ./mypackage
+  hone -goal "add table-driven tests for the parser" -max-runs 10 ./mypackage
 
 Flags:
 `)
@@ -116,6 +126,10 @@ azure, ollama, openai-compatible, ...). API keys are read from
 openai-compatible (any self-hosted server speaking the OpenAI chat
 protocol, e.g. llama.cpp's llama-server or vLLM) need no key — point
 them at your server with -host.
+
+With -goal, every "passed" run is checked by a second, read-only hone
+process before it's accepted (disable with -verify=false). A rejection is
+recorded in AGENT_NOTES.md and the loop tries again.
 
 eval_config.json in the package root optionally provides package-specific
 context (description, extra rules, source list) — see EvalConfig.
@@ -136,15 +150,21 @@ func run() int {
 	maxSteps := flag.Int("max-steps", 200, "maximum agent steps")
 	maxTokens := flag.Int("max-tokens", 0, "token budget (0 = unlimited)")
 	goal := flag.String("goal", "", "custom mission, replacing the built-in quality-pass mission. "+
-		"When set, eval_loop re-invokes the agent (each call still bounded by -max-steps) up to "+
+		"When set, hone re-invokes the agent (each call still bounded by -max-steps) up to "+
 		"-max-runs times in a row until it calls finish, carrying context forward via AGENT_NOTES.md")
 	maxRuns := flag.Int("max-runs", 20, "max consecutive agent invocations when -goal is set (ignored for the default quality-pass mission)")
 	format := flag.String("format", "auto", "result output format: auto (rendered via glow on a terminal, "+
 		"ANSI-styled text as a fallback, plain markdown when not a terminal), markdown, or json")
+	readOnly := flag.Bool("readonly", false, "register only read/grep/find tools (no write/edit/shell) — for review/analysis missions")
+	verify := flag.Bool("verify", true, "when -goal is set, spawn a read-only reviewer subprocess to judge each "+
+		"'passed' run's changes against the goal before accepting it; a rejection's feedback is recorded as a "+
+		"note and the loop continues (ignored for the default quality-pass mission)")
+	reviewModel := flag.String("review-model", "", "model ref for the reviewer subprocess (default: same as -model)")
+	reviewHost := flag.String("review-host", "", "host override for the reviewer subprocess (default: same as -host)")
 	flag.Parse()
 
 	if *showVersion {
-		fmt.Printf("eval_loop version: %s  commit: %s\n", version, commit)
+		fmt.Printf("hone version: %s  commit: %s\n", version, commit)
 		return 0
 	}
 
@@ -195,7 +215,7 @@ func run() int {
 	providerID, _, hasSlash := strings.Cut(*model, "/")
 	providerID = strings.TrimSpace(providerID)
 	if !hasSlash || providerID == "" {
-		fmt.Fprintf(os.Stderr, "eval_loop: -model %q must be of the form \"provider/model\"\n", *model)
+		fmt.Fprintf(os.Stderr, "hone: -model %q must be of the form \"provider/model\"\n", *model)
 		return 1
 	}
 	pcfg := providerConfigFor(providerID)
@@ -209,7 +229,7 @@ func run() int {
 	})
 
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))
-	logger.Info("starting eval run", "model", *model, "host", *host, "pkg_root", pkgRoot,
+	logger.Info("starting hone run", "model", *model, "host", *host, "pkg_root", pkgRoot,
 		"max_steps", *maxSteps, "gate_test", *gateTest, "gate_lint", *gateLint, "goal", *goal != "")
 
 	runs := 1
@@ -218,6 +238,7 @@ func run() int {
 	}
 
 	var res agentloop.Result
+	accepted := false
 	for i := 1; i <= runs; i++ {
 		if *goal != "" {
 			logger.Info("goal run starting", "run", i, "of", runs)
@@ -251,31 +272,158 @@ func run() int {
 				{Name: "go-fix-diff", Argv: []string{"go", "fix", "-diff", "./..."}},
 				{Name: "go-doc", Argv: []string{"go", "doc", "-all", "."}},
 			},
-			Budget: agentloop.Budget{MaxSteps: *maxSteps, MaxTokens: *maxTokens},
-			Logger: logger,
+			Budget:   agentloop.Budget{MaxSteps: *maxSteps, MaxTokens: *maxTokens},
+			ReadOnly: *readOnly,
+			Logger:   logger,
 		})
 		stopHeartbeat()
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "eval_loop: %v\n", err)
+			fmt.Fprintf(os.Stderr, "hone: %v\n", err)
 			return 1
+		}
+
+		approved := true
+		var reviewFeedback string
+		if *goal != "" && *verify && res.Status == agentloop.StatusPassed {
+			var rerr error
+			approved, reviewFeedback, rerr = runReview(pkgRoot, *model, *host, *reviewModel, *reviewHost, mission, res, logger)
+			if rerr != nil {
+				logger.Warn("reviewer failed to run, accepting the worker's result as-is", "error", rerr)
+				approved = true
+			} else if approved {
+				logger.Info("reviewer approved the change")
+			} else {
+				logger.Warn("reviewer rejected the change", "feedback", reviewFeedback)
+			}
 		}
 
 		printResult(res, i, runs, *format)
 
-		if res.Status == agentloop.StatusPassed || res.Status == agentloop.StatusIdle {
+		if res.Status == agentloop.StatusIdle || (res.Status == agentloop.StatusPassed && approved) {
+			accepted = true
 			break
+		}
+		if !approved {
+			notes := agentloop.FileNotesStore{Path: filepath.Join(pkgRoot, "AGENT_NOTES.md")}
+			entry := fmt.Sprintf("Reviewer rejected run %d's changes (verified_by: independent read-only review subprocess): %s", i, reviewFeedback)
+			if nerr := notes.Append(context.Background(), entry); nerr != nil {
+				logger.Warn("failed to record reviewer feedback in notes", "error", nerr)
+			}
 		}
 		if i < runs {
 			logger.Warn("goal not finished, starting another run", "status", res.Status, "stop_reason", res.StopReason)
 		}
 	}
 
-	switch res.Status {
-	case agentloop.StatusPassed, agentloop.StatusIdle:
+	if accepted {
 		return 0
-	default:
-		return 2
 	}
+	return 2
+}
+
+// reviewOutputLimit bounds how much of the git diff is handed to the
+// reviewer — enough to judge the change, not so much it dwarfs the
+// worker's own context.
+const reviewOutputLimit = 8000
+
+// runReview spawns a fresh, read-only hone process against the same
+// package to independently judge whether the worker's "passed" result
+// actually satisfies mission, rather than trusting the worker's own
+// self-report. The reviewer runs with -readonly (agentloop.Config.ReadOnly
+// strips write/edit/shell down to the tool registry, not just a prompt
+// rule) and -verify=false, so it can never mutate files and can never
+// recurse into spawning a reviewer of its own.
+//
+// Returns approved and the reviewer's reasoning. err is reserved for
+// infrastructure failures (couldn't resolve/spawn/parse the subprocess);
+// a reviewer that ran fine but gave no clear verdict is treated as a
+// rejection (approved=false) rather than silently trusting the worker.
+func runReview(pkgRoot, model, host, reviewModel, reviewHost, mission string, worker agentloop.Result, logger *slog.Logger) (approved bool, feedback string, err error) {
+	exe, err := os.Executable()
+	if err != nil {
+		return false, "", fmt.Errorf("resolve own executable: %w", err)
+	}
+
+	m := reviewModel
+	if m == "" {
+		m = model
+	}
+	h := reviewHost
+	if h == "" {
+		h = host
+	}
+
+	diff := gitDiff(pkgRoot)
+	diffSection := ""
+	if diff != "" {
+		diffSection = fmt.Sprintf("\nDiff of its changes (working tree vs HEAD):\n```diff\n%s\n```\n", diff)
+	}
+
+	reviewGoal := fmt.Sprintf(
+		"You are reviewing another agent's work; you did not do it and cannot change it — you have no write access.\n\n"+
+			"Original goal given to that agent:\n%s\n\n"+
+			"The agent reported (its own self-assessment, not to be trusted blindly):\n%s\n\n"+
+			"Files it touched: %s\n%s\n"+
+			"Read what you need to and decide whether the goal was genuinely met and nothing was broken. "+
+			"Call finish with a summary starting with exactly \"VERDICT: PASS\" or \"VERDICT: FAIL\", "+
+			"followed by your reasoning.",
+		mission, worker.Summary, strings.Join(worker.Changes, ", "), diffSection,
+	)
+
+	args := []string{
+		"-model", m,
+		"-goal", reviewGoal,
+		"-max-runs", "1",
+		"-max-steps", "40",
+		"-readonly",
+		"-verify=false",
+		"-format", "json",
+	}
+	if h != "" {
+		args = append(args, "-host", h)
+	}
+	args = append(args, pkgRoot)
+
+	logger.Info("spawning reviewer", "model", m)
+	cmd := exec.Command(exe, args...)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if runErr := cmd.Run(); runErr != nil {
+		return false, "", fmt.Errorf("reviewer process failed: %w (stderr: %s)", runErr, stderr.String())
+	}
+
+	var reviewRes agentloop.Result
+	if jerr := json.Unmarshal(bytes.TrimSpace(stdout.Bytes()), &reviewRes); jerr != nil {
+		return false, "", fmt.Errorf("parse reviewer output: %w", jerr)
+	}
+
+	summary := strings.TrimSpace(reviewRes.Summary)
+	switch {
+	case strings.HasPrefix(summary, "VERDICT: PASS"):
+		return true, summary, nil
+	case strings.HasPrefix(summary, "VERDICT: FAIL"):
+		return false, summary, nil
+	default:
+		return false, summary, nil
+	}
+}
+
+// gitDiff returns the working-tree diff for pkgRoot against HEAD,
+// truncated to reviewOutputLimit. Empty if pkgRoot isn't a git repo, git
+// isn't installed, or there's nothing to diff — the reviewer falls back
+// to reading files directly in that case.
+func gitDiff(pkgRoot string) string {
+	cmd := exec.Command("git", "-C", pkgRoot, "diff", "--", ".")
+	out, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+	diff := string(out)
+	if len(diff) > reviewOutputLimit {
+		diff = diff[:reviewOutputLimit] + "\n... (truncated)"
+	}
+	return diff
 }
 
 // startHeartbeat logs progress every 15s until the returned func is
@@ -342,7 +490,7 @@ func renderMarkdown(res agentloop.Result, run, of int) string {
 	var b strings.Builder
 
 	heading := strings.ToUpper(string(res.Status)[:1]) + string(res.Status)[1:]
-	fmt.Fprintf(&b, "## eval_loop — %s\n\n", heading)
+	fmt.Fprintf(&b, "## hone — %s\n\n", heading)
 
 	if of > 1 {
 		fmt.Fprintf(&b, "- **Run:** %d of %d\n", run, of)
@@ -392,7 +540,7 @@ func statusANSI(status agentloop.Status) string {
 func renderPlainTerm(res agentloop.Result, run, of int) string {
 	var b strings.Builder
 
-	fmt.Fprintf(&b, "%s%seval_loop — %s%s\n\n", ansiBold, statusANSI(res.Status), strings.ToUpper(string(res.Status)), ansiReset)
+	fmt.Fprintf(&b, "%s%shone — %s%s\n\n", ansiBold, statusANSI(res.Status), strings.ToUpper(string(res.Status)), ansiReset)
 
 	if of > 1 {
 		fmt.Fprintf(&b, "  %sRun:%s           %d of %d\n", ansiBold, ansiReset, run, of)
@@ -564,13 +712,13 @@ func sourceFilesFor(pkgRoot string, cfg EvalConfig, skip []string) []string {
 }
 
 // renderSystemPrompt builds the system prompt template by:
-// 1. Deriving packageName from cfg.PackageName or falling back to
-//    filepath.Base(pkgRoot).
-// 2. Building pkgStructure: a sorted list of - go.mod and all discovered
-//    .go files (excluding skip dirs).
-// 3. Using cfg.BuildCommands if provided, otherwise the default.
-// 4. Parsing system_prompt.tmpl with PromptData and returning the rendered
-//    string, or an error on template failure.
+//  1. Deriving packageName from cfg.PackageName or falling back to
+//     filepath.Base(pkgRoot).
+//  2. Building pkgStructure: a sorted list of - go.mod and all discovered
+//     .go files (excluding skip dirs).
+//  3. Using cfg.BuildCommands if provided, otherwise the default.
+//  4. Parsing system_prompt.tmpl with PromptData and returning the rendered
+//     string, or an error on template failure.
 func renderSystemPrompt(pkgRoot string, cfg EvalConfig, skip []string) (string, error) {
 	packageName := cfg.PackageName
 	if packageName == "" {

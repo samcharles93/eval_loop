@@ -1,4 +1,4 @@
-module eval
+module hone
 
 go 1.26.2
 
